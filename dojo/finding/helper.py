@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 from contextlib import suppress
 from datetime import datetime
 from itertools import batched
@@ -901,6 +902,70 @@ def bulk_clear_finding_m2m(finding_qs):
         Notes.objects.filter(id__in=note_ids).delete()
 
 
+def detach_inbound_duplicate_references(chunk_ids, delete_scope_ids):
+    """
+    Resolve ``duplicate_finding`` references into ``chunk_ids`` held by findings that survive.
+
+    Callers reconcile the duplicate graph once, up front, before handing a queryset to
+    the chunked delete. Anything written after that pass -- deduplication of a
+    concurrent import lands on an original the delete has selected but not yet reached
+    -- is still there when the chunk COMMITs, and the self-FK rejects it.
+
+    Runs inside the chunk's own transaction so no such window exists, and covers only
+    findings outside ``delete_scope_ids``: a reference from one doomed finding to
+    another goes away with the row that holds it.
+
+    Each survivor inherits its original's own original when that finding outlives the
+    delete, and is promoted to an original otherwise -- the same remedy
+    prepare_duplicates_for_delete already applies to outside-scope references.
+
+    Returns the number of survivors whose reference was resolved.
+    """
+    survivors = list(
+        Finding.objects
+        .filter(duplicate_finding_id__in=chunk_ids)
+        .exclude(id__in=delete_scope_ids)
+        .values_list("id", "duplicate_finding_id"),
+    )
+    if not survivors:
+        return 0
+
+    # The doomed findings' own originals: the natural new parent for anything pointing
+    # at them. Bounded by the chunk, so this stays a single small query.
+    parent_of_doomed = dict(
+        Finding.objects.filter(id__in=chunk_ids).values_list("id", "duplicate_finding_id"),
+    )
+    candidate_parent_ids = {parent_id for parent_id in parent_of_doomed.values() if parent_id}
+    surviving_parent_ids = set(
+        Finding.objects
+        .filter(id__in=candidate_parent_ids)
+        .exclude(id__in=delete_scope_ids)
+        .values_list("id", flat=True),
+    ) if candidate_parent_ids else set()
+
+    repoint_groups = defaultdict(list)  # surviving original id -> [survivor ids]
+    promote_ids = []
+    for survivor_id, doomed_parent_id in survivors:
+        new_parent_id = parent_of_doomed.get(doomed_parent_id)
+        if new_parent_id in surviving_parent_ids and new_parent_id != survivor_id:
+            repoint_groups[new_parent_id].append(survivor_id)
+        else:
+            promote_ids.append(survivor_id)
+
+    deduplicationLogger.warning(
+        "bulk delete: resolving %d inbound duplicate reference(s) written after the caller's "
+        "prepare pass (%d re-pointed, %d promoted to original)",
+        len(survivors), len(survivors) - len(promote_ids), len(promote_ids),
+    )
+
+    for new_parent_id, survivor_ids in repoint_groups.items():
+        Finding.objects.filter(id__in=survivor_ids).update(duplicate_finding_id=new_parent_id)
+    if promote_ids:
+        Finding.objects.filter(id__in=promote_ids).update(duplicate_finding=None, duplicate=False)
+
+    return len(survivors)
+
+
 def _bulk_delete_findings_internal(finding_qs, chunk_size=1000, *, order_desc=False):
     """
     Delete findings and all related objects efficiently. Including any related object in Dojo-Pro
@@ -920,6 +985,11 @@ def _bulk_delete_findings_internal(finding_qs, chunk_size=1000, *, order_desc=Fa
     constraint error naming an internal table. Per chunk, the through rows and the
     findings they point at go in one transaction and no such window exists.
 
+    The self-referential duplicate_finding FK is resolved the same way, and for the
+    same reason: detach_inbound_duplicate_references runs per chunk, inside the
+    transaction, so a duplicate link written after the caller's prepare pass cannot
+    reach the chunk's COMMIT.
+
     When order_desc is True, findings are processed highest id first (matches
     finding_delete: duplicate_cluster.order_by("-id").delete()) so self-FK
     duplicate chains delete children before parents.
@@ -932,6 +1002,9 @@ def _bulk_delete_findings_internal(finding_qs, chunk_size=1000, *, order_desc=Fa
 
     pre_bulk_delete_findings.send(sender=Finding, finding_qs=finding_qs)
     ordered_qs = finding_qs.order_by("-id") if order_desc else finding_qs.order_by("id")
+    # Kept as a subquery so the full delete scope never materializes in Python; it is
+    # only needed to tell a surviving finding from one this run is about to remove.
+    delete_scope_ids = finding_qs.order_by().values_list("id", flat=True)
     for chunk_num, chunk_ids in enumerate(
         batched(
             ordered_qs.values_list("id", flat=True).iterator(chunk_size=chunk_size),
@@ -943,6 +1016,7 @@ def _bulk_delete_findings_internal(finding_qs, chunk_size=1000, *, order_desc=Fa
         chunk_qs = Finding.objects.filter(id__in=chunk_ids)
         with transaction.atomic():
             bulk_clear_finding_m2m(chunk_qs)
+            detach_inbound_duplicate_references(chunk_ids, delete_scope_ids)
             cascade_delete_related_objects(Finding, chunk_qs, skip_relations={Finding}, skip_m2m_for={Finding})
             execute_delete_sql(chunk_qs)
         logger.info(
