@@ -200,38 +200,66 @@ class TestBulkDeleteFindingsDuplicateFK(DojoTestCase):
         )
         connection.check_constraints()
 
-    def test_reference_written_mid_delete_into_the_delete_set_is_left_alone(self):
+    def test_only_references_into_the_chunk_are_touched(self):
         """
-        Only findings that outlive the delete are resolved.
+        Resolving the chunk's inbound references must not disturb anything else.
 
-        A reference from one doomed finding to another goes away with the row that holds
-        it, so re-pointing it would be pointless churn.
+        A duplicate that already points at the surviving original is not part of this
+        delete and has to come through it byte for byte -- re-pointing or promoting it
+        would silently rewrite duplicate clusters on every delete.
         """
-        original = self._create_finding("Dupe FK inside original")
-        doomed_first = self._create_finding("Dupe FK inside doomed A", duplicate_of=original)
-        doomed_second = self._create_finding("Dupe FK inside doomed B", duplicate_of=original)
+        original = self._create_finding("Dupe FK scoping original")
+        doomed_first = self._create_finding("Dupe FK scoping doomed A", duplicate_of=original)
+        doomed_second = self._create_finding("Dupe FK scoping doomed B", duplicate_of=original)
+        survivor_of_doomed = self._create_finding("Dupe FK scoping survivor of doomed")
+        survivor_of_original = self._create_finding(
+            "Dupe FK scoping survivor of original", duplicate_of=original,
+        )
 
-        def point_doomed_second_at_doomed_first():
-            # doomed_second is deleted in the first chunk (highest id), so this write
-            # never actually lands; the callback exists to keep the harness identical.
-            Finding.objects.filter(id=doomed_second.id).update(
+        def point_survivor_at_doomed_first():
+            Finding.objects.filter(id=survivor_of_doomed.id).update(
+                duplicate=True,
                 duplicate_finding_id=doomed_first.id,
             )
 
         self._delete_with_reference_written_mid_delete(
             [doomed_first, doomed_second],
-            point_doomed_second_at_doomed_first,
+            point_survivor_at_doomed_first,
         )
 
         self.assertFalse(
             Finding.objects.filter(id__in=[doomed_first.id, doomed_second.id]).exists(),
             "Both excess duplicates should have been deleted.",
         )
+
+        survivor_of_doomed.refresh_from_db()
+        self.assertEqual(
+            survivor_of_doomed.duplicate_finding_id, original.id,
+            msg=(
+                "the reference into the chunk should have been resolved, "
+                f"persisted duplicate_finding_id={survivor_of_doomed.duplicate_finding_id}"
+            ),
+        )
+
+        survivor_of_original.refresh_from_db()
+        self.assertEqual(
+            survivor_of_original.duplicate_finding_id, original.id,
+            msg=(
+                "a duplicate of the surviving original is out of scope and must be left as-is, "
+                f"persisted duplicate_finding_id={survivor_of_original.duplicate_finding_id}"
+            ),
+        )
+        self.assertTrue(
+            survivor_of_original.duplicate,
+            "an out-of-scope duplicate must not be promoted to an original.",
+        )
+
         original.refresh_from_db()
         self.assertIsNone(
             original.duplicate_finding_id,
             "the surviving original must not be touched by the delete.",
         )
+        self.assertFalse(original.duplicate, "the surviving original must stay an original.")
         connection.check_constraints()
 
     def test_existing_duplicate_references_delete_cleanly(self):

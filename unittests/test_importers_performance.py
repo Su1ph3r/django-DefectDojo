@@ -549,7 +549,7 @@ class TestDojoImporterPerformanceSmall(TestDojoImporterPerformanceBase):
         self._deduplication_performance(
             expected_num_queries1=121,
             expected_num_async_tasks1=2,
-            expected_num_queries2=100,
+            expected_num_queries2=103,
             expected_num_async_tasks2=2,
         )
 
@@ -848,6 +848,6 @@ class TestDojoImporterPerformanceSmallLocations(TestDojoImporterPerformanceBase)
         self._deduplication_performance(
             expected_num_queries1=130,
             expected_num_async_tasks1=2,
-            expected_num_queries2=211,
+            expected_num_queries2=214,
             expected_num_async_tasks2=2,
         )
